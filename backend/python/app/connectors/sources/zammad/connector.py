@@ -99,9 +99,10 @@ class ZammadConnector(BaseConnector):
         logger: Logger,
         data_entities_processor: DataSourceEntitiesProcessor,
         data_store_provider: DataStoreProvider,
-        config_service: ConfigurationService
+        config_service: ConfigurationService,
+        connector_id: str
     ) -> None:
-        super().__init__(ZammadApp(), logger, data_entities_processor, data_store_provider, config_service)
+        super().__init__(ZammadApp(), logger, data_entities_processor, data_store_provider, config_service, connector_id)
         self.zammad_client: Optional[ZammadClient] = None
         self.zammad_datasource: Optional[ZammadDataSource] = None
         self.base_url: Optional[str] = None
@@ -114,6 +115,7 @@ class ZammadConnector(BaseConnector):
         self.kb_answers_data: List[Dict[str, Any]] = []
         self.kb_full_response_data: Dict[str, Any] = {}
         self.roles_data: List[Dict[str, Any]] = []
+        self.connector_id = connector_id
 
         self._init_sync_points()
 
@@ -126,7 +128,7 @@ class ZammadConnector(BaseConnector):
 
         def _create_sync_point(sync_data_point_type: SyncDataPointType) -> SyncPoint:
             return SyncPoint(
-                connector_name=Connectors.ZAMMAD,
+                connector_id=self.connector_id,
                 org_id=org_id,
                 sync_data_point_type=sync_data_point_type,
                 data_store_provider=self.data_store_provider
@@ -141,10 +143,11 @@ class ZammadConnector(BaseConnector):
     async def init(self) -> None:
         """Initialize Zammad client using token from config"""
         try:
-            config: Optional[Dict[str, Any]] = await self.config_service.get_config("/services/connectors/zammad/config")
+            connector_id = self.connector_id
+            config: Optional[Dict[str, Any]] = await self.config_service.get_config(f"/services/connectors/{connector_id}/config")
 
             if not config:
-                raise ValueError("Zammad configuration not found")
+                raise ValueError(f"Zammad configuration not found for connector {connector_id}")
 
             auth_config: Dict[str, Any] = config.get("auth", {})
             self.base_url = auth_config.get("base_url") or auth_config.get("baseUrl")
@@ -164,7 +167,7 @@ class ZammadConnector(BaseConnector):
             self.logger.info("Zammad client initialized successfully")
 
         except Exception as e:
-            self.logger.error(f"Failed to initialize Zammad client: {e}")
+            self.logger.error(f"Failed to initialize Zammad client for connector {self.connector_id}: {e}")
             raise
 
     async def run_sync(self) -> None:
@@ -201,11 +204,8 @@ class ZammadConnector(BaseConnector):
             org_id: Optional[str] = self.data_entities_processor.org_id
             if not org_id:
                 raise ValueError("Organization ID not found")
-
-            apps: List[Dict[str, Any]] = await self.data_store_provider.arango_service.get_org_apps(org_id)
-            app_key: Optional[str] = next((a.get("_key") for a in apps if a.get("type") == Connectors.ZAMMAD.value), None)
-
-            if not app_key:
+            connector_id=self.connector_id
+            if not connector_id:
                 self.logger.warning("Zammad app not found for organization")
                 return
 
@@ -229,21 +229,47 @@ class ZammadConnector(BaseConnector):
             async with self.data_store_provider.transaction() as tx_store:
                 await self._create_role_nodes(tx_store)
 
-            sub_org_map: Dict[str, str] = await self._process_sub_organizations(org_id, app_key)
-            user_id_map: Dict[str, str] = await self._process_users(org_id, app_key, sub_org_map)
-            groups_map: Dict[str, str] = await self._process_groups(org_id, app_key)
-            await self._create_group_app_edges(app_key, groups_map, sub_org_map)
+            sub_org_map: Dict[str, str] = await self._process_sub_organizations(org_id,connector_id)
+            user_id_map: Dict[str, str] = await self._process_users(org_id, connector_id, sub_org_map)
+            groups_map: Dict[str, str] = await self._process_groups(org_id, connector_id)
+            await self._create_group_app_edges(connector_id, groups_map, sub_org_map)
 
             async with self.data_store_provider.transaction() as tx_store:
                 await self._process_tickets(tx_store, org_id, sub_org_map, user_id_map)
 
             if self.kb_categories_data or self.kb_answers_data:
-                await self._process_knowledge_base(org_id, app_key)
+                await self._process_knowledge_base(org_id, connector_id)
 
         except Exception as e:
             self.logger.error(f"Error building nodes and edges: {e}", exc_info=True)
             raise
+        
+    def _get_user_role_keys(self, user: Dict[str, Any]) -> List[str]:
+        """
+        Get ALL role keys for a user (users can have multiple roles).
+        """
 
+        role_ids: List[int] = user.get("role_ids", [])
+
+        if not role_ids:
+            self.logger.warning(f"User {user.get('id')} has no role_ids, defaulting to 'customer'")
+            return ["zammad_customer"]
+
+        role_keys: List[str] = []
+
+        if self.roles_data:
+            for role_id in role_ids:
+                role: Optional[Dict[str, Any]] = next((r for r in self.roles_data if r.get("id") == role_id), None)
+                if role and role.get("active", False):
+                    role_name = role.get("name", "").lower().replace(' ', '_')
+                    role_key = f"{self.connector_id}_{role_name}"
+                    role_keys.append(role_key)
+                else:
+                    self.logger.warning(f"Role ID {role_id} not found or inactive for user {user.get('id')}")
+
+            if role_keys:
+                return role_keys
+            
     async def _create_role_nodes(self, tx_store: TransactionStore) -> None:
         """Create AppUserGroup nodes for Zammad roles (used for KB category permissions)."""
         try:
@@ -255,12 +281,13 @@ class ZammadConnector(BaseConnector):
             for role in self.roles_data:
                 role_id = role.get("id")
                 role_name = role.get("name", "").lower().replace(' ', '_')
-                role_key: str = f"zammad_{role_name}"
+                role_key: str = f"{self.connector_id}_{role_name}"
 
                 role_group = AppUserGroup(
                     id=role_key,
                     source_user_group_id=str(role_id),
                     app_name=Connectors.ZAMMAD,
+                    connector_id=self.connector_id,
                     org_id=self.data_entities_processor.org_id,
                     name=role.get("name") or role_key,
                     description=role.get("note") or f"Zammad Role: {role.get('name')}",
@@ -276,7 +303,7 @@ class ZammadConnector(BaseConnector):
             self.logger.error(f"Error creating role nodes: {e}", exc_info=True)
             raise
 
-    async def _process_groups(self, org_id: str, app_key: str) -> Dict[str, str]:
+    async def _process_groups(self, org_id: str, connector_id: str) -> Dict[str, str]:
         """Process groups and return mapping of Zammad group ID to internal AppUserGroup ID."""
         try:
 
@@ -304,6 +331,7 @@ class ZammadConnector(BaseConnector):
                     user_group = AppUserGroup(
                         source_user_group_id=external_group_id,
                         app_name=Connectors.ZAMMAD,
+                        connector_id=self.connector_id,
                         name=group_name,
                         active=group.get("active", True),
                         description=group.get("note") or ""
@@ -340,7 +368,7 @@ class ZammadConnector(BaseConnector):
 
     async def _create_group_app_edges(
         self,
-        app_key: str,
+        connector_id: str,
         groups_map: Optional[Dict[str, str]] = None,
         orgs_map: Optional[Dict[str, str]] = None
     ) -> None:
@@ -352,7 +380,7 @@ class ZammadConnector(BaseConnector):
                 for external_id, user_group_id in groups_map.items():
                     edge = {
                         "_from": f"{CollectionNames.GROUPS.value}/{user_group_id}",
-                        "_to": f"{CollectionNames.APPS.value}/{app_key}",
+                        "_to": f"{CollectionNames.APPS.value}/{connector_id}",
                         "entityType": "GROUP",
                         "createdAtTimestamp": get_epoch_timestamp_in_ms(),
                         "updatedAtTimestamp": get_epoch_timestamp_in_ms()
@@ -363,7 +391,7 @@ class ZammadConnector(BaseConnector):
                 for external_id, user_group_id in orgs_map.items():
                     edge = {
                         "_from": f"{CollectionNames.GROUPS.value}/{user_group_id}",
-                        "_to": f"{CollectionNames.APPS.value}/{app_key}",
+                        "_to": f"{CollectionNames.APPS.value}/{connector_id}",
                         "entityType": "ORGANIZATION",
                         "createdAtTimestamp": get_epoch_timestamp_in_ms(),
                         "updatedAtTimestamp": get_epoch_timestamp_in_ms()
@@ -381,7 +409,7 @@ class ZammadConnector(BaseConnector):
             self.logger.error(f"Error creating group/org app edges: {e}", exc_info=True)
             raise
 
-    async def _process_sub_organizations(self, org_id: str, app_key: str, all_users_data: Optional[List[Dict[str, Any]]] = None) -> Dict[str, str]:
+    async def _process_sub_organizations(self, org_id: str, connector_id: str, all_users_data: Optional[List[Dict[str, Any]]] = None) -> Dict[str, str]:
         """
         Process sub-organizations as AppUserGroup.
         """
@@ -411,6 +439,7 @@ class ZammadConnector(BaseConnector):
                     user_group = AppUserGroup(
                         source_user_group_id=external_org_id,
                         app_name=Connectors.ZAMMAD,
+                        connector_id=self.connector_id,
                         name=org_name,
                         description=sub_org.get("note") or f"Zammad Organization: {org_name}",
                         created_at_timestamp=created_at
@@ -448,7 +477,7 @@ class ZammadConnector(BaseConnector):
             self.logger.error(f"Error processing sub-organizations: {e}", exc_info=True)
             raise
 
-    async def _process_users(self, org_id: str, app_key: str, sub_org_map: Dict[str, str]) -> Dict[str, str]:
+    async def _process_users(self, org_id: str, connector_id: str, sub_org_map: Dict[str, str]) -> Dict[str, str]:
         """Process users and create edges. Returns mapping of external_user_id -> internal_user_id."""
         try:
 
@@ -469,6 +498,7 @@ class ZammadConnector(BaseConnector):
                 updated_at: int = self._parse_datetime_to_timestamp(user.get("updated_at"))
                 app_user: AppUser = AppUser(
                     app_name=Connectors.ZAMMAD,
+                    connector_id=self.connector_id,
                     source_user_id=external_user_id,
                     org_id=org_id,
                     email=email,
@@ -546,31 +576,6 @@ class ZammadConnector(BaseConnector):
             self.logger.error(f"Error processing users: {e}", exc_info=True)
             raise
 
-    def _get_user_role_keys(self, user: Dict[str, Any]) -> List[str]:
-        """
-        Get ALL role keys for a user (users can have multiple roles).
-        """
-
-        role_ids: List[int] = user.get("role_ids", [])
-
-        if not role_ids:
-            self.logger.warning(f"User {user.get('id')} has no role_ids, defaulting to 'customer'")
-            return ["zammad_customer"]
-
-        role_keys: List[str] = []
-
-        if self.roles_data:
-            for role_id in role_ids:
-                role: Optional[Dict[str, Any]] = next((r for r in self.roles_data if r.get("id") == role_id), None)
-                if role and role.get("active", False):
-                    role_name = role.get("name", "").lower().replace(' ', '_')
-                    role_key = f"zammad_{role_name}"
-                    role_keys.append(role_key)
-                else:
-                    self.logger.warning(f"Role ID {role_id} not found or inactive for user {user.get('id')}")
-
-            if role_keys:
-                return role_keys
 
         # Fallback to hardcoded mapping if roles_data is not available
         self.logger.warning(f"Using fallback role mapping for user {user.get('id')} with role_ids: {role_ids}")
@@ -792,7 +797,7 @@ class ZammadConnector(BaseConnector):
                 external_ticket_id: str = str(ticket.get("id"))
 
                 existing_record = await tx_store.get_record_by_external_id(
-                    connector_name=Connectors.ZAMMAD,
+                    connector_id=self.connector_id,
                     external_id=external_ticket_id,
                     record_type="TICKET"
                 )
@@ -825,6 +830,7 @@ class ZammadConnector(BaseConnector):
                     record_type=RecordType.TICKET,
                     external_record_id=external_ticket_id,
                     connector_name=Connectors.ZAMMAD,
+                    connector_id=self.connector_id,
                     origin=OriginTypes.CONNECTOR,
                     mime_type=MimeTypes.HTML.value,
                     weburl=f"{self.base_url}/#ticket/zoom/{external_ticket_id}" if self.base_url else None,
@@ -868,7 +874,7 @@ class ZammadConnector(BaseConnector):
                                 filtered_attachment_records = []
                                 for file_record, _ in attachment_records:
                                     existing_attachment = await tx_store.get_record_by_external_id(
-                                        connector_name=Connectors.ZAMMAD,
+                                        connector_id=self.connector_id,
                                         external_id=file_record.external_record_id,
                                         record_type="FILE"
                                     )
@@ -1128,11 +1134,9 @@ class ZammadConnector(BaseConnector):
             org_id: Optional[str] = self.data_entities_processor.org_id
             if not org_id:
                 raise ValueError("Organization ID not found")
+            connector_id=self.connector_id
 
-            apps: List[Dict[str, Any]] = await self.data_store_provider.arango_service.get_org_apps(org_id)
-            app_key: Optional[str] = next((a.get("_key") for a in apps if a.get("type") == Connectors.ZAMMAD.value), None)
-
-            if not app_key:
+            if not connector_id:
                 self.logger.warning("Zammad app not found for organization")
                 return
 
@@ -1145,18 +1149,18 @@ class ZammadConnector(BaseConnector):
             async with self.data_store_provider.transaction() as tx_store:
                 await self._create_role_nodes(tx_store)
 
-            sub_org_map: Dict[str, str] = await self._process_sub_organizations(org_id, app_key, all_users_data=self.users_data)
-            user_id_map: Dict[str, str] = await self._process_users(org_id, app_key, sub_org_map)
+            sub_org_map: Dict[str, str] = await self._process_sub_organizations(org_id, connector_id, all_users_data=self.users_data)
+            user_id_map: Dict[str, str] = await self._process_users(org_id, connector_id, sub_org_map)
 
-            groups_map: Dict[str, str] = await self._process_groups(org_id, app_key)
-            await self._create_group_app_edges(app_key, groups_map, sub_org_map)
+            groups_map: Dict[str, str] = await self._process_groups(org_id, connector_id)
+            await self._create_group_app_edges(connector_id, groups_map, sub_org_map)
 
             async with self.data_store_provider.transaction() as tx_store:
                 if self.tickets_data and len(self.tickets_data) > 0:
                     await self._process_tickets(tx_store, org_id, sub_org_map, user_id_map, self.users_data)
 
                 if self.kb_categories_data or self.kb_answers_data:
-                    await self._process_knowledge_base(org_id, app_key)
+                    await self._process_knowledge_base(org_id, connector_id)
 
 
         except Exception as e:
@@ -1736,19 +1740,19 @@ class ZammadConnector(BaseConnector):
             self.logger.error(f"Error fetching Roles: {e}", exc_info=True)
             return []
 
-    async def _process_knowledge_base(self, org_id: str, app_key: str) -> None:
+    async def _process_knowledge_base(self, org_id: str, connector_id: str) -> None:
         """Process KB categories as RecordGroups and KB answers as WebpageRecords"""
         try:
 
             # Step 1: Process KB categories as RecordGroups (no transaction needed - edges created separately)
-            kb_category_map: Dict[str, str] = await self._process_kb_categories(org_id, app_key)
+            kb_category_map: Dict[str, str] = await self._process_kb_categories(org_id, connector_id)
             await self._process_kb_answers_as_records(org_id, kb_category_map)
 
         except Exception as e:
             self.logger.error(f"Error processing Knowledge Base: {e}", exc_info=True)
             raise
 
-    async def _process_kb_categories(self, org_id: str, app_key: str) -> Dict[str, str]:
+    async def _process_kb_categories(self, org_id: str, connector_id: str) -> Dict[str, str]:
 
         """Process KB categories as RecordGroups. Returns mapping of category_id to record_group_id"""
         try:
@@ -1767,6 +1771,7 @@ class ZammadConnector(BaseConnector):
                     name=category_name,
                     external_group_id=external_category_id,
                     connector_name=Connectors.ZAMMAD,
+                    connector_id=self.connector_id,
                     group_type=RecordGroupType.KB,
                     created_at=created_at,
                     updated_at=updated_at,
@@ -1789,7 +1794,7 @@ class ZammadConnector(BaseConnector):
                     for record_group, _ in record_groups_with_permissions:
                         record_group_app_edge: Dict[str, Any] = {
                             "_from": f"{CollectionNames.RECORD_GROUPS.value}/{record_group.id}",
-                            "_to": f"{CollectionNames.APPS.value}/{app_key}",
+                            "_to": f"{CollectionNames.APPS.value}/{connector_id}",
                             "entityType": "KB",
                             "createdAtTimestamp": get_epoch_timestamp_in_ms(),
                             "updatedAtTimestamp": get_epoch_timestamp_in_ms()
@@ -1863,6 +1868,7 @@ class ZammadConnector(BaseConnector):
                     external_record_id=str(attachment_id),
                     external_record_group_id="",
                     connector_name=Connectors.ZAMMAD,
+                    connector_id=self.connector_id,
                     origin=OriginTypes.CONNECTOR,
                     version=0,
                     created_at=created_at,
@@ -1883,6 +1889,7 @@ class ZammadConnector(BaseConnector):
                     record_type=RecordType.FILE,
                     external_record_id=str(attachment_id),
                     connector_name=Connectors.ZAMMAD,
+                    connector_id=self.connector_id,
                     origin=OriginTypes.CONNECTOR,
                     version=0,
                     created_at=created_at,
@@ -1948,6 +1955,7 @@ class ZammadConnector(BaseConnector):
                         external_record_id=str(attachment_id),
                         external_record_group_id="",
                         connector_name=Connectors.ZAMMAD,
+                        connector_id=self.connector_id,
                         origin=OriginTypes.CONNECTOR,
                         version=0,
                         created_at=created_at,
@@ -1969,6 +1977,7 @@ class ZammadConnector(BaseConnector):
                         record_type=RecordType.FILE,
                         external_record_id=str(attachment_id),
                         connector_name=Connectors.ZAMMAD,
+                        connector_id=self.connector_id,
                         origin=OriginTypes.CONNECTOR,
                         version=0,
                         created_at=created_at,
@@ -2024,7 +2033,7 @@ class ZammadConnector(BaseConnector):
 
                     # Check if record already exists (for deduplication)
                     existing_record = await tx_store.get_record_by_external_id(
-                        connector_name=Connectors.ZAMMAD,
+                        connector_id=self.connector_id,
                         external_id=external_answer_id,
                         record_type="WEBPAGE"
                     )
@@ -2040,6 +2049,7 @@ class ZammadConnector(BaseConnector):
                         record_type=RecordType.WEBPAGE,
                         external_record_id=external_answer_id,
                         connector_name=Connectors.ZAMMAD,
+                        connector_id=self.connector_id,
                         origin=OriginTypes.CONNECTOR,
                         mime_type=MimeTypes.HTML.value,
                         weburl=f"{self.base_url}/help/en-us/{category_id}/{answer.get('id')}" if self.base_url else None,
@@ -2075,7 +2085,7 @@ class ZammadConnector(BaseConnector):
                             for file_record, _ in attachment_records:
                                 # Check if attachment already exists
                                 existing_attachment = await tx_store.get_record_by_external_id(
-                                    connector_name=Connectors.ZAMMAD,
+                                    connector_id=self.connector_id,
                                     external_id=file_record.external_record_id,
                                     record_type="FILE"
                                 )
@@ -2378,6 +2388,7 @@ class ZammadConnector(BaseConnector):
         logger: Logger,
         data_store_provider: DataStoreProvider,
         config_service: ConfigurationService,
+        connector_id: str
     ) -> BaseConnector:
         """Create and initialize ZammadConnector instance"""
         data_entities_processor: DataSourceEntitiesProcessor = DataSourceEntitiesProcessor(
@@ -2391,5 +2402,6 @@ class ZammadConnector(BaseConnector):
             logger=logger,
             data_entities_processor=data_entities_processor,
             data_store_provider=data_store_provider,
-            config_service=config_service
+            config_service=config_service,
+            connector_id=connector_id
         )
