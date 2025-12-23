@@ -322,7 +322,7 @@ def adf_to_text(adf_content: Dict[str, Any]) -> str:
     .with_auth_type("OAUTH")\
     .with_description("Sync issues from Jira Cloud")\
     .with_categories(["Storage"])\
-    .with_scopes([ConnectorScope.PERSONAL.value, ConnectorScope.TEAM.value])\
+    .with_scopes([ConnectorScope.TEAM.value])\
     .configure(lambda builder: builder
         .with_icon("/assets/icons/connectors/jira.svg")
         .add_documentation_link(DocumentationLink(
