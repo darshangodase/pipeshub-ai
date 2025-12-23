@@ -454,7 +454,8 @@ class JiraConnector(BaseConnector):
             # Use JiraClient.build_from_services() to create client with proper auth
             client = await JiraClient.build_from_services(
                 self.logger,
-                self.config_service
+                self.config_service,
+                self.connector_id
             )
 
             # Create DataSource from client
@@ -478,7 +479,8 @@ class JiraConnector(BaseConnector):
         """
         Get access token from config
         """
-        config = await self.config_service.get_config(f"{OAUTH_JIRA_CONFIG_PATH}")
+        config_path = OAUTH_JIRA_CONFIG_PATH.format(connector_id=self.connector_id)
+        config = await self.config_service.get_config(config_path)
         access_token = config.get("credentials", {}).get("access_token") if config else None
         if not access_token:
             raise ValueError("Jira access token not found in configuration")
@@ -491,7 +493,8 @@ class JiraConnector(BaseConnector):
         # Rebuild client with fresh token from configuration
         client = await JiraClient.build_from_services(
             self.logger,
-            self.config_service
+            self.config_service,
+            self.connector_id
         )
 
         # Track client for cleanup (helps reduce connection leaks)
