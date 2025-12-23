@@ -2287,6 +2287,20 @@ class BaseArangoService:
             file_record = await self.get_document(record_id, CollectionNames.FILES.value) if record.get("recordType") == "FILE" else await self.get_document(record_id, CollectionNames.MAILS.value)
 
             self.logger.info(f"📋 File record: {file_record}")
+
+            # If record has AUTO_INDEX_OFF status, update it to NOT_STARTED before reindexing
+            # This allows manual reindex to proceed while keeping automatic indexing blocked
+            current_indexing_status = record.get("indexingStatus")
+            if current_indexing_status == ProgressStatus.AUTO_INDEX_OFF.value:
+                self.logger.info(f"🔄 Record {record_id} has AUTO_INDEX_OFF status, updating to NOT_STARTED for manual reindex")
+                await self.update_node(
+                    record_id,
+                    {"indexingStatus": ProgressStatus.NOT_STARTED.value},
+                    CollectionNames.RECORDS.value
+                )
+                # Update local record dict for payload
+                record["indexingStatus"] = ProgressStatus.NOT_STARTED.value
+
             # Create and publish reindex event
             try:
                 payload = await self._create_reindex_event_payload(record, file_record,user_id,request)
@@ -3846,6 +3860,10 @@ class BaseArangoService:
                 extension = file_record.get("extension", "")
                 mime_type = file_record.get("mimeType", "")
 
+            # Fallback to record's mimeType for TICKET, COMMENT, and other record types
+            if not mime_type:
+                mime_type = record.get("mimeType", "")
+
             # Fallback: check if mimeType is in the record itself (for WebpageRecord, CommentRecord, etc.)
             if not mime_type:
                 mime_type = record.get("mimeType", "")
@@ -4269,6 +4287,127 @@ class BaseArangoService:
                 "❌ Failed to retrieve internal key for external file ID %s %s: %s", connector_id, external_id, str(e)
             )
             return None
+
+    async def get_record_by_issue_key(
+        self, connector_name: Connectors, issue_key: str, transaction: Optional[TransactionDatabase] = None
+    ) -> Optional[Record]:
+        """
+        Get Jira issue record by issue key (e.g., PROJ-123) by searching weburl pattern.
+
+        Args:
+            connector_name (Connectors): Connector name (should be JIRA)
+            issue_key (str): Jira issue key (e.g., "PROJ-123")
+            transaction (Optional[TransactionDatabase]): Optional database transaction
+
+        Returns:
+            Optional[Record]: Record if found, None otherwise
+        """
+        try:
+            self.logger.info(
+                "🚀 Retrieving record for Jira issue key %s %s", connector_name, issue_key
+            )
+
+            # Search for record where weburl contains "/browse/{issue_key}" and record_type is TICKET
+            query = f"""
+            FOR record IN {CollectionNames.RECORDS.value}
+                FILTER record.connectorName == @connector_name
+                    AND record.recordType == @record_type
+                    AND record.webUrl != null
+                    AND CONTAINS(record.webUrl, @browse_pattern)
+                RETURN record
+            """
+
+            browse_pattern = f"/browse/{issue_key}"
+            db = transaction if transaction else self.db
+            cursor = db.aql.execute(
+                query, 
+                bind_vars={
+                    "connector_name": connector_name.value,
+                    "record_type": "TICKET",
+                    "browse_pattern": browse_pattern
+                }
+            )
+            result = next(cursor, None)
+
+            if result:
+                self.logger.info(
+                    "✅ Successfully retrieved record for Jira issue key %s %s", connector_name, issue_key
+                )
+                return Record.from_arango_base_record(result)
+            else:
+                self.logger.warning(
+                    "⚠️ No record found for Jira issue key %s %s", connector_name, issue_key
+                )
+                return None
+
+        except Exception as e:
+            self.logger.error(
+                "❌ Failed to retrieve record for Jira issue key %s %s: %s", connector_name, issue_key, str(e)
+            )
+            return None
+
+    async def get_records_by_parent(
+        self,
+        connector_name: Connectors,
+        parent_external_record_id: str,
+        record_type: Optional[str] = None,
+        transaction: Optional[TransactionDatabase] = None
+    ) -> List[Record]:
+        """
+        Get all child records for a parent record by parent_external_record_id.
+        Optionally filter by record_type.
+
+        Args:
+            connector_name (Connectors): Connector name
+            parent_external_record_id (str): Parent record's external ID
+            record_type (Optional[str]): Optional filter by record type (e.g., "COMMENT", "FILE", "TICKET")
+            transaction (Optional[TransactionDatabase]): Optional database transaction
+
+        Returns:
+            List[Record]: List of child records
+        """
+        try:
+            self.logger.debug(
+                "🚀 Retrieving child records for parent %s %s (record_type: %s)", 
+                connector_name, parent_external_record_id, record_type or "all"
+            )
+
+            query = f"""
+            FOR record IN {CollectionNames.RECORDS.value}
+                FILTER record.externalParentId != null
+                    AND record.externalParentId == @parent_id 
+                    AND record.connectorName == @connector_name
+            """
+
+            bind_vars = {
+                "parent_id": parent_external_record_id,
+                "connector_name": connector_name.value
+            }
+
+            if record_type:
+                query += " AND record.recordType == @record_type"
+                bind_vars["record_type"] = record_type
+
+            query += " RETURN record"
+
+            db = transaction if transaction else self.db
+            cursor = db.aql.execute(query, bind_vars=bind_vars)
+            results = list(cursor)
+
+            records = [Record.from_arango_base_record(result) for result in results]
+
+            self.logger.debug(
+                "✅ Successfully retrieved %d child record(s) for parent %s %s", 
+                len(records), connector_name, parent_external_record_id
+            )
+            return records
+
+        except Exception as e:
+            self.logger.error(
+                "❌ Failed to retrieve child records for parent %s %s: %s", 
+                connector_name, parent_external_record_id, str(e)
+            )
+            return []
 
     # TODO: expand this method for specific users list
     async def get_records_by_status(
