@@ -403,15 +403,19 @@ class JiraConnector(BaseConnector):
         logger: Logger,
         data_entities_processor: DataSourceEntitiesProcessor,
         data_store_provider: DataStoreProvider,
-        config_service: ConfigurationService
+        config_service: ConfigurationService,
+        connector_id: str
     ) -> None:
         super().__init__(
-            JiraApp(),
+            JiraApp(connector_id),
             logger,
             data_entities_processor,
             data_store_provider,
-            config_service
+            config_service,
+            connector_id
         )
+        self.connector_id = connector_id
+        
         self.data_source: Optional[JiraDataSource] = None
         self.cloud_id: Optional[str] = None
         self.site_url: Optional[str] = None
@@ -422,7 +426,7 @@ class JiraConnector(BaseConnector):
         org_id = self.data_entities_processor.org_id
 
         self.issues_sync_point = SyncPoint(
-            connector_name=Connectors.JIRA,
+            connector_id=self.connector_id,
             org_id=org_id,
             sync_data_point_type=SyncDataPointType.RECORDS,
             data_store_provider=data_store_provider
@@ -440,6 +444,7 @@ class JiraConnector(BaseConnector):
             self.sync_filters, self.indexing_filters = await load_connector_filters(
                 self.config_service,
                 "jira",
+                self.connector_id,
                 self.logger
             )
 
@@ -817,6 +822,7 @@ class JiraConnector(BaseConnector):
 
             app_user = AppUser(
                 app_name=Connectors.JIRA,
+                connector_id=self.connector_id,
                 source_user_id=account_id,
                 org_id=org_id,
                 email=email,
@@ -946,7 +952,7 @@ class JiraConnector(BaseConnector):
 
                 # Get issue record by issue key using direct query
                 issue_record = await tx_store.get_record_by_issue_key(
-                    connector_name=Connectors.JIRA,
+                    connector_id=self.connector_id,
                     issue_key=issue_key
                 )
 
@@ -1014,7 +1020,7 @@ class JiraConnector(BaseConnector):
 
             # Direct query by parent_external_record_id and record_type - efficient
             child_records = await tx_store.get_records_by_parent(
-                connector_name=Connectors.JIRA,
+                connector_id=self.connector_id,
                 parent_external_record_id=parent_issue_id,
                 record_type=child_type.value
             )
@@ -1294,6 +1300,7 @@ class JiraConnector(BaseConnector):
                     # Create AppUserGroup (always create, even if no members)
                     user_group = AppUserGroup(
                         app_name=Connectors.JIRA,
+                        connector_id=self.connector_id,
                         source_user_group_id=group_id,
                         name=group_name,
                         org_id=org_id,
@@ -1524,6 +1531,7 @@ class JiraConnector(BaseConnector):
                         # Build AppRole with external_id matching Permission format
                         app_role = AppRole(
                             app_name=Connectors.JIRA,
+                            connector_id=self.connector_id,
                             source_role_id=f"{project_key}_{role_id}",
                             name=f"{project_key} - {role_name}",
                         )
@@ -1634,6 +1642,7 @@ class JiraConnector(BaseConnector):
                 # Create AppRole for project lead (even if no lead exists - to clean up old edges)
                 app_role = AppRole(
                     app_name=Connectors.JIRA,
+                    connector_id=self.connector_id,
                     source_role_id=f"{project_key}_projectLead",
                     name=f"{project_key} - Project Lead"
                 )
@@ -1755,6 +1764,7 @@ class JiraConnector(BaseConnector):
                 id=str(uuid4()),
                 external_group_id=project_id,
                 connector_name=Connectors.JIRA,
+                connector_id=self.connector_id,
                 name=project_name,
                 short_name=project_key,
                 group_type=RecordGroupType.JIRA_PROJECT,
@@ -2073,7 +2083,7 @@ class JiraConnector(BaseConnector):
 
             # Check for existing record (works for both Epics and regular issues)
             existing_record = await tx_store.get_record_by_external_id(
-                connector_name=Connectors.JIRA,
+                connector_id=self.connector_id,
                 external_id=issue_id
             )
 
@@ -2125,6 +2135,7 @@ class JiraConnector(BaseConnector):
                 record_type=RecordType.TICKET,
                 origin=OriginTypes.CONNECTOR,
                 connector_name=Connectors.JIRA,
+                connector_id=self.connector_id,
                 record_group_type=record_group_type,
                 external_record_group_id=external_record_group_id,
                 parent_external_record_id=parent_record_id,
@@ -2227,14 +2238,14 @@ class JiraConnector(BaseConnector):
         
         # First try new-style external ID (attachment_<id>)
         record = await tx_store.get_record_by_external_id(
-            connector_name=Connectors.JIRA,
+            connector_id=self.connector_id,
             external_id=external_id,
         )
         
         # Fallback: some older data might have used the raw Jira ID as external_record_id
         if not record:
             legacy_record = await tx_store.get_record_by_external_id(
-                connector_name=Connectors.JIRA,
+                connector_id=self.connector_id,
                 external_id=str(attachment_id),
             )
             if legacy_record:
@@ -2350,7 +2361,7 @@ class JiraConnector(BaseConnector):
 
             # Case 2: Handle unmatched filenames and description changes
             existing_records = await tx_store.get_records_by_parent(
-                connector_name=Connectors.JIRA,
+                connector_id=self.connector_id,
                 parent_external_record_id=issue_id,
                 record_type=RecordType.FILE.value
             )
@@ -2502,7 +2513,7 @@ class JiraConnector(BaseConnector):
 
                 # Check for existing comment record
                 existing_record = await tx_store.get_record_by_external_id(
-                    connector_name=Connectors.JIRA,
+                    connector_id=self.connector_id,
                     external_id=f"comment_{comment_id}"
                 )
 
@@ -2556,6 +2567,7 @@ class JiraConnector(BaseConnector):
                     parent_record_type=parent_record_type,
                     external_record_group_id=parent_record_group_id,
                     connector_name=Connectors.JIRA,
+                    connector_id=self.connector_id,
                     origin=OriginTypes.CONNECTOR,
                     version=version,
                     mime_type=MimeTypes.MARKDOWN.value,
@@ -2607,7 +2619,7 @@ class JiraConnector(BaseConnector):
         try:
             # Direct query for comments by parent issue - efficient
             existing_records = await tx_store.get_records_by_parent(
-                connector_name=Connectors.JIRA,
+                connector_id=self.connector_id,
                 parent_external_record_id=issue_id,
                 record_type=RecordType.COMMENT.value
             )
@@ -2679,7 +2691,7 @@ class JiraConnector(BaseConnector):
 
                 # Check for existing attachment record
                 existing_record = await tx_store.get_record_by_external_id(
-                    connector_name=Connectors.JIRA,
+                    connector_id=self.connector_id,
                     external_id=f"attachment_{attachment_id}"
                 )
 
@@ -2725,6 +2737,7 @@ class JiraConnector(BaseConnector):
                     parent_record_type=RecordType.TICKET,
                     external_record_group_id=parent_record_group_id,
                     connector_name=Connectors.JIRA,
+                    connector_id=self.connector_id,
                     origin=OriginTypes.CONNECTOR,
                     version=version,
                     mime_type=mime_type,
@@ -3134,6 +3147,7 @@ class JiraConnector(BaseConnector):
                 record_type=RecordType.TICKET,
                 origin=OriginTypes.CONNECTOR,
                 connector_name=Connectors.JIRA,
+                connector_id=self.connector_id,
                 record_group_type=record.record_group_type if hasattr(record, 'record_group_type') else RecordGroupType.JIRA_PROJECT,
                 external_record_group_id=record.external_record_group_id if hasattr(record, 'external_record_group_id') else project_id,
                 parent_external_record_id=record.parent_external_record_id if hasattr(record, 'parent_external_record_id') else issue_data.get("parent_external_id"),
@@ -3231,6 +3245,7 @@ class JiraConnector(BaseConnector):
                 parent_record_type=RecordType.TICKET,
                 external_record_group_id=record.external_record_group_id if hasattr(record, 'external_record_group_id') else None,
                 connector_name=Connectors.JIRA,
+                connector_id=self.connector_id,
                 origin=OriginTypes.CONNECTOR,
                 version=version,
                 mime_type=MimeTypes.MARKDOWN.value,
@@ -3370,6 +3385,7 @@ class JiraConnector(BaseConnector):
                 parent_record_type=RecordType.TICKET,
                 external_record_group_id=record.external_record_group_id if hasattr(record, 'external_record_group_id') else None,
                 connector_name=Connectors.JIRA,
+                connector_id=self.connector_id,
                 origin=OriginTypes.CONNECTOR,
                 version=version,
                 mime_type=mime_type,
@@ -3492,7 +3508,8 @@ class JiraConnector(BaseConnector):
         cls,
         logger: Logger,
         data_store_provider: DataStoreProvider,
-        config_service: ConfigurationService
+        config_service: ConfigurationService,
+        connector_id: str
     ) -> "BaseConnector":
         """Factory method to create JiraConnector instance"""
         data_entities_processor = DataSourceEntitiesProcessor(
@@ -3506,5 +3523,6 @@ class JiraConnector(BaseConnector):
             logger,
             data_entities_processor,
             data_store_provider,
-            config_service
+            config_service,
+            connector_id
         )
