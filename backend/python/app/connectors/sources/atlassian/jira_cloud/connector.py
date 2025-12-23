@@ -392,6 +392,8 @@ def adf_to_text(adf_content: Dict[str, Any]) -> str:
             description="Enable indexing of issue attachments",
             default_value=True
         ))
+        .with_sync_support(True)
+        .with_agent_support(True)
     )\
     .build_decorator()
 class JiraConnector(BaseConnector):
