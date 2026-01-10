@@ -111,6 +111,7 @@ class CollectionNames(Enum):
     WEBPAGES = "webpages"
     COMMENTS = "comments"
     TICKETS = "tickets"
+    PROJECTS = "projects"
 
     # Users and groups
     PEOPLE = "people"
@@ -289,5 +290,6 @@ RECORD_TYPE_COLLECTION_MAPPING = {
     "COMMENT": CollectionNames.COMMENTS.value,
     "INLINE_COMMENT": CollectionNames.COMMENTS.value,
     "LINK": CollectionNames.LINKS.value,
+    "PROJECT": CollectionNames.PROJECTS.value,
     # Note: MESSAGE, DRIVE, SHAREPOINT_*, and other types are stored only in records collection
 }
