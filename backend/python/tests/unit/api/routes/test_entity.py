@@ -480,6 +480,19 @@ class TestGetTeam:
         assert content["team"]["name"] == "T1"
 
     @pytest.mark.asyncio
+    async def test_scopes_lookup_to_callers_org(self):
+        # Security: the team lookup must be scoped to the caller's org so a team
+        # id from another tenant cannot be read (cross-org roster disclosure).
+        req = _make_request()
+        gp = _graph_provider(req)
+        gp.get_user_by_user_id.return_value = {"_key": "uk"}
+        gp.get_team_with_users.return_value = {"name": "T1", "users": []}
+
+        await get_team(req, "all_other-org")
+
+        assert gp.get_team_with_users.await_args.kwargs["org_id"] == "org-1"
+
+    @pytest.mark.asyncio
     async def test_user_not_found(self):
         req = _make_request()
         gp = _graph_provider(req)

@@ -244,7 +244,7 @@ async def create_team(request: Request) -> JSONResponse:
         logger.info(f"Team created successfully: {team_body}")
 
         # Fetch the created team with users and permissions
-        team_with_users = await graph_provider.get_team_with_users(team_id=team_key, user_key=user['_key'])
+        team_with_users = await graph_provider.get_team_with_users(team_id=team_key, org_id=user_info.get("orgId"), user_key=user['_key'])
 
     except Exception as e:
         logger.error(f"Error in create_team: {str(e)}", exc_info=True)
@@ -277,7 +277,7 @@ async def get_team(request: Request, team_id: str) -> JSONResponse:
         raise HTTPException(status_code=404, detail="User not found")
     try:
         # Use interface method to get team with users
-        result = await graph_provider.get_team_with_users(team_id=team_id, user_key=user['_key'])
+        result = await graph_provider.get_team_with_users(team_id=team_id, org_id=user_info.get("orgId"), user_key=user['_key'])
         if not result:
             raise HTTPException(status_code=404, detail="Team not found")
 
@@ -445,7 +445,7 @@ async def update_team(request: Request, team_id: str) -> JSONResponse:
                     logger.info(f"Added {len(user_team_edges)} users to team {team_id}")
 
         # Return updated team with users
-        updated_team = await graph_provider.get_team_with_users(team_id=team_id, user_key=user['_key'])
+        updated_team = await graph_provider.get_team_with_users(team_id=team_id, org_id=user_info.get("orgId"), user_key=user['_key'])
 
         return JSONResponse(
             status_code=200,
